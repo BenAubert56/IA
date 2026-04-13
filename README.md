@@ -2,7 +2,7 @@
 
 ## 1. Créer un environnement virtuel
 ```bash
-python3.12 -m venv env
+python -m venv env
 ```
 
 ## 2. Activer l'environnement

@@ -1,1 +1,102 @@
+# 🔹 Environnements virtuels
 env/
+venv/
+.venv/
+ENV/
+
+# 🔹 Fichiers Python compilés
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 🔹 Extensions C
+*.so
+
+# 🔹 Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 🔹 Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 🔹 Tests / couverture
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# 🔹 Jupyter Notebook
+.ipynb_checkpoints
+
+# 🔹 Environnements
+.env
+.env.*
+*.env
+
+# 🔹 IDE / éditeurs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# 🔹 OS files
+.DS_Store
+Thumbs.db
+
+# 🔹 Logs
+*.log
+
+# 🔹 Fichiers temporaires
+*.tmp
+*.swp
+
+# 🔹 Mypy / type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# 🔹 Pyre / Pytype
+.pyre/
+.pytype/
+
+# 🔹 Ruff / lint
+.ruff_cache/
+
+# 🔹 Poetry
+poetry.lock
+
+# 🔹 PDM
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+# 🔹 PyInstaller
+*.spec
+
+# 🔹 Profiling
+.prof
+
+# 🔹 Données locales
+data/
