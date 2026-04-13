@@ -99,4 +99,4 @@ poetry.lock
 .prof
 
 # 🔹 Données locales
-data/
+images_kiruna/

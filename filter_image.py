@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 # Dossier source (racine)
-SOURCE_DIR = Path("data/allsky-sweden-kiruna-2024-2")
+SOURCE_DIR = Path("data/allsky-sweden-kiruna-2024-1")
 
 # Dossier destination
 DEST_DIR = Path("data/image")
