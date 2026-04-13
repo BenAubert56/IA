@@ -1,0 +1,12 @@
+<View>
+  <Image name="image" value="$image"/>
+  <Choices name="label" toName="image">
+    <Choice value="Clairs sans aurores"/>
+    <Choice value="Nuageux sans aurores"/>
+    <Choice value="Clairs avec aurores légères"/>
+    <Choice value="Nuageux avec aurores légères"/>
+    <Choice value="Clairs avec aurores fortes"/>
+    <Choice value="Nuageux avec aurores fortes"/>
+    <Choice value="Obstrués"/>
+  </Choices>
+</View>
