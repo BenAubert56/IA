@@ -4,10 +4,10 @@ import shutil
 from pathlib import Path
 
 # Dossier source (racine)
-SOURCE_DIR = Path("data/allsky-sweden-kiruna-2024-1")
+SOURCE_DIR = Path("images_kiruna/allsky-sweden-kiruna-2024-2")
 
 # Dossier destination
-DEST_DIR = Path("data/image")
+DEST_DIR = Path("data/image_test")
 
 # Nombre d'images à garder
 NB_IMAGES = 500

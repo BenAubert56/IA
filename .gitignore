@@ -100,3 +100,4 @@ poetry.lock
 
 # 🔹 Données locales
 images_kiruna/
+image_test/
