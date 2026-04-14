@@ -4,27 +4,28 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import models, transforms
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, classification_report
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-JSON_PATH   = "data_trainning.json"
-IMAGES_DIR  = "data/images/"   # dossier contenant les .jpg
-BATCH_SIZE  = 16
-EPOCHS      = 50
-LR          = 1e-3
-SEED        = 42
+JSON_PATH = "data_trainning.json"
+IMAGES_DIR = "data/images/"
+BATCH_SIZE = 8
+EPOCHS = 30
+LR = 1e-5
+SEED = 42
 
 TRAIN_RATIO = 0.70
-VAL_RATIO   = 0.15
-TEST_RATIO  = 0.15
-# TRAIN + VAL + TEST = 1.0
-# ───────────────────────────────────────────────────────────────────────────────
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
 
-# ─── SEED / REPRODUCTIBILITÉ ───────────────────────────────────────────────────
+EARLY_STOPPING_PATIENCE = 5
+BEST_MODEL_PATH = "best_model_aurora.pth"
+
+# ─── SEED ──────────────────────────────────────────────────────────────────────
 random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -41,7 +42,6 @@ CLASSES = [
     "Obstrués"
 ]
 label2idx = {label: i for i, label in enumerate(CLASSES)}
-idx2label = {i: label for label, i in label2idx.items()}
 
 # ─── 1. LECTURE DU JSON ────────────────────────────────────────────────────────
 with open(JSON_PATH, "r", encoding="utf-8") as f:
@@ -64,7 +64,8 @@ print(f"✅ {len(samples)} images valides trouvées\n")
 print("Répartition globale :")
 for i, cls in enumerate(CLASSES):
     count = sum(1 for _, l in samples if l == i)
-    print(f"  {cls}: {count}")
+    pct = (count / len(samples)) * 100 if len(samples) > 0 else 0
+    print(f"  {cls}: {count} ({pct:.2f}%)")
 
 if len(samples) < 10:
     raise ValueError("Pas assez d'images valides pour entraîner un modèle.")
@@ -73,7 +74,6 @@ if len(samples) < 10:
 paths = [s[0] for s in samples]
 labels = [s[1] for s in samples]
 
-# D'abord on sépare TRAIN du reste
 train_paths, temp_paths, train_labels, temp_labels = train_test_split(
     paths,
     labels,
@@ -82,8 +82,6 @@ train_paths, temp_paths, train_labels, temp_labels = train_test_split(
     random_state=SEED
 )
 
-# Puis on sépare le reste en VAL / TEST
-# Comme temp = 30%, on coupe en deux pour faire 15% / 15%
 val_paths, test_paths, val_labels, test_labels = train_test_split(
     temp_paths,
     temp_labels,
@@ -93,15 +91,15 @@ val_paths, test_paths, val_labels, test_labels = train_test_split(
 )
 
 train_samples = list(zip(train_paths, train_labels))
-val_samples   = list(zip(val_paths, val_labels))
-test_samples  = list(zip(test_paths, test_labels))
+val_samples = list(zip(val_paths, val_labels))
+test_samples = list(zip(test_paths, test_labels))
 
 print("\nRépartition après split :")
 print(f"  Train: {len(train_samples)}")
 print(f"  Val  : {len(val_samples)}")
 print(f"  Test : {len(test_samples)}")
 
-# ─── 3. DATASET PERSONNALISÉ ───────────────────────────────────────────────────
+# ─── 3. DATASET ────────────────────────────────────────────────────────────────
 class AuroraDataset(Dataset):
     def __init__(self, samples, transform=None):
         self.samples = samples
@@ -117,12 +115,13 @@ class AuroraDataset(Dataset):
             image = self.transform(image)
         return image, label
 
-# ─── 4. TRANSFORMS ──────────────────────────────────────────────────────────────
+# ─── 4. TRANSFORMS ─────────────────────────────────────────────────────────────
 train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((256, 256)),
+    transforms.RandomResizedCrop(224, scale=(0.90, 1.0)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ColorJitter(brightness=0.15, contrast=0.15),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
                          [0.229, 0.224, 0.225])
@@ -136,29 +135,67 @@ eval_transform = transforms.Compose([
 ])
 
 train_dataset = AuroraDataset(train_samples, transform=train_transform)
-val_dataset   = AuroraDataset(val_samples, transform=eval_transform)
-test_dataset  = AuroraDataset(test_samples, transform=eval_transform)
+val_dataset = AuroraDataset(val_samples, transform=eval_transform)
+test_dataset = AuroraDataset(test_samples, transform=eval_transform)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+# ─── 5. WEIGHTED RANDOM SAMPLER ────────────────────────────────────────────────
+train_labels_only = [label for _, label in train_samples]
+class_counts = [train_labels_only.count(i) for i in range(len(CLASSES))]
+class_sample_weights = [1.0 / count if count > 0 else 0.0 for count in class_counts]
+sample_weights = [class_sample_weights[label] for label in train_labels_only]
 
-# ─── 5. DEVICE ──────────────────────────────────────────────────────────────────
+sampler = WeightedRandomSampler(
+    weights=sample_weights,
+    num_samples=len(sample_weights),
+    replacement=True
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    sampler=sampler
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+# ─── 6. DEVICE ─────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\n🚀 Entraînement sur : {device}")
 
-# ─── 6. MODÈLE ──────────────────────────────────────────────────────────────────
-model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+# ─── 7. MODÈLE ─────────────────────────────────────────────────────────────────
+model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
 
-# On gèle le backbone pour un premier POC
+# Fine-tuning partiel : layer3 + layer4 + fc
 for param in model.parameters():
     param.requires_grad = False
 
-model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
+for param in model.layer3.parameters():
+    param.requires_grad = True
+
+for param in model.layer4.parameters():
+    param.requires_grad = True
+
+for param in model.fc.parameters():
+    param.requires_grad = True
+
 model = model.to(device)
 
-# ─── 7. LOSS / OPTIMIZER ────────────────────────────────────────────────────────
-# Pondération simple des classes selon leur fréquence dans le train
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Paramètres entraînables : {trainable_params} / {total_params}")
+
+# ─── 8. LOSS / OPTIMIZER / SCHEDULER ───────────────────────────────────────────
 train_class_counts = [sum(1 for _, l in train_samples if l == i) for i in range(len(CLASSES))]
 class_weights = []
 for count in train_class_counts:
@@ -170,9 +207,21 @@ for count in train_class_counts:
 class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
 
 criterion = nn.CrossEntropyLoss(weight=class_weights)
-optimizer = torch.optim.Adam(model.fc.parameters(), lr=LR)
 
-# ─── 8. FONCTIONS D'ÉVALUATION ─────────────────────────────────────────────────
+optimizer = torch.optim.AdamW(
+    filter(lambda p: p.requires_grad, model.parameters()),
+    lr=LR,
+    weight_decay=1e-4
+)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="max",
+    factor=0.5,
+    patience=2
+)
+
+# ─── 9. EVALUATION ─────────────────────────────────────────────────────────────
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
@@ -199,13 +248,13 @@ def evaluate(model, loader, criterion, device):
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
 
-    avg_loss = total_loss / total if total > 0 else 0
-    acc = 100 * correct / total if total > 0 else 0
+    avg_loss = total_loss / total if total > 0 else 0.0
+    acc = 100 * correct / total if total > 0 else 0.0
     return avg_loss, acc, all_labels, all_preds
 
-# ─── 9. ENTRAÎNEMENT ────────────────────────────────────────────────────────────
+# ─── 10. ENTRAÎNEMENT + EARLY STOPPING ─────────────────────────────────────────
 best_val_acc = 0.0
-best_model_path = "best_model_aurora.pth"
+epochs_without_improvement = 0
 
 for epoch in range(EPOCHS):
     model.train()
@@ -231,26 +280,40 @@ for epoch in range(EPOCHS):
         correct += (preds == labels).sum().item()
         total += labels.size(0)
 
-    train_loss = total_loss / total if total > 0 else 0
-    train_acc = 100 * correct / total if total > 0 else 0
+    train_loss = total_loss / total if total > 0 else 0.0
+    train_acc = 100 * correct / total if total > 0 else 0.0
 
     val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion, device)
 
+    current_lr = optimizer.param_groups[0]["lr"]
+
     print(
         f"Epoch {epoch+1}/{EPOCHS} | "
+        f"LR: {current_lr:.6f} | "
         f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | "
         f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%"
     )
 
+    scheduler.step(val_acc)
+
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(model.state_dict(), best_model_path)
+        epochs_without_improvement = 0
+        torch.save(model.state_dict(), BEST_MODEL_PATH)
+        print(f"  ✅ Nouveau meilleur modèle sauvegardé")
+    else:
+        epochs_without_improvement += 1
+        print(f"  ⏳ Pas d'amélioration depuis {epochs_without_improvement} epoch(s)")
 
-print(f"\n✅ Meilleur modèle sauvegardé : {best_model_path}")
-print(f"✅ Meilleure accuracy validation : {best_val_acc:.2f}%")
+    if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+        print(f"\n🛑 Early stopping déclenché à l'epoch {epoch+1}")
+        break
 
-# ─── 10. TEST FINAL ─────────────────────────────────────────────────────────────
-model.load_state_dict(torch.load(best_model_path, map_location=device))
+print(f"\n✅ Meilleure accuracy validation : {best_val_acc:.2f}%")
+print(f"✅ Modèle chargé depuis : {BEST_MODEL_PATH}")
+
+# ─── 11. TEST FINAL ────────────────────────────────────────────────────────────
+model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=device))
 
 test_loss, test_acc, y_true, y_pred = evaluate(model, test_loader, criterion, device)
 
