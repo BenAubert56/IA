@@ -1,8 +1,8 @@
 import os
-import json
 import copy
 import random
 from collections import Counter
+from multiprocessing import freeze_support
 
 import numpy as np
 from PIL import Image
@@ -20,46 +20,26 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score
 # =========================================================
 # CONFIG
 # =========================================================
-JSON_PATH = "data_trainning.json"
-IMAGES_DIR = "data/images"   # à adapter
+# Dossier parent contenant les sous-dossiers par classe
+IMAGES_DIR = "data/image_test"
 
-IMG_SIZE = 260  # taille native B2 = 260
+IMG_SIZE = 224
 BATCH_SIZE = 16
-NUM_WORKERS = 0
+NUM_WORKERS = 0   # Windows safe
 SEED = 42
 
 NUM_EPOCHS_PHASE1 = 8
-NUM_EPOCHS_PHASE2 = 12
-NUM_EPOCHS_PHASE3 = 12
-EARLY_STOPPING_PATIENCE = 5
+NUM_EPOCHS_PHASE2 = 10
+EARLY_STOPPING_PATIENCE = 4
 
-BEST_MODEL_PATH = "best_model_aurora_effb2_final.pth"
+PHASE1_LR = 1e-3
+PHASE2_LR = 1e-4
+WEIGHT_DECAY = 1e-4
+LABEL_SMOOTHING = 0.10
+
+BEST_MODEL_PATH = "best_model_resnet18_flat_final2.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# MixUp
-MIXUP_ALPHA = 0.4
-MIXUP_PROB = 0.4
-
-# TTA
-TTA_N = 3
-
-
-# =========================================================
-# REPRODUCTIBILITE
-# =========================================================
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-set_seed(SEED)
-
-
-# =========================================================
-# CLASSES
-# =========================================================
 CLASS_NAMES = [
     "Clairs sans aurores",
     "Nuageux sans aurores",
@@ -74,28 +54,39 @@ NUM_CLASSES = len(CLASS_NAMES)
 
 
 # =========================================================
+# UTILS
+# =========================================================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def count_params(model):
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return trainable, total
+
+
+# =========================================================
 # TRANSFORMS
 # =========================================================
 train_transform = transforms.Compose([
-    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0)),
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.90, 1.0)),
     transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(12),
+    transforms.RandomRotation(8),
     transforms.ColorJitter(
-        brightness=0.2,
-        contrast=0.2,
-        saturation=0.1,
-        hue=0.02
+        brightness=0.12,
+        contrast=0.12,
+        saturation=0.06,
+        hue=0.015
     ),
-    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2)),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]
-    ),
-    transforms.RandomErasing(
-        p=0.15,
-        scale=(0.02, 0.08),
-        ratio=(0.3, 3.3)
     ),
 ])
 
@@ -108,95 +99,36 @@ eval_transform = transforms.Compose([
     ),
 ])
 
-tta_transform = transforms.Compose([
-    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.92, 1.0)),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    ),
-])
-
 
 # =========================================================
-# LECTURE JSON LABEL STUDIO
+# FOLDER PARSING
 # =========================================================
-def extract_filename(task):
-    file_upload = task.get("file_upload")
-    if file_upload:
-        return os.path.basename(file_upload)
-
-    data = task.get("data", {})
-    image_path = data.get("image")
-    if image_path:
-        return os.path.basename(image_path)
-
-    return None
-
-
-def extract_label(task):
-    annotations = task.get("annotations", [])
-    if not annotations:
-        return None
-
-    for ann in annotations:
-        results = ann.get("result", [])
-        if not results:
-            continue
-
-        for res in results:
-            value = res.get("value", {})
-            choices = value.get("choices", [])
-            if choices:
-                return choices[0]
-
-    return None
-
-
-def load_samples_from_labelstudio(json_path, images_dir, class_to_idx):
-    with open(json_path, "r", encoding="utf-8") as f:
-        tasks = json.load(f)
-
+def load_samples_from_folders(images_dir, class_to_idx):
+    """
+    Parcourt les sous-dossiers correspondant aux classes pour extraire
+    les chemins d'images et leurs labels.
+    """
     samples = []
-    skipped_no_label = 0
-    skipped_bad_label = 0
-    skipped_missing_file = 0
+    valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif')
 
-    for task in tasks:
-        filename = extract_filename(task)
-        label_name = extract_label(task)
-
-        if label_name is None:
-            skipped_no_label += 1
+    for class_name, idx in class_to_idx.items():
+        class_dir = os.path.join(images_dir, class_name)
+        
+        if not os.path.exists(class_dir) or not os.path.isdir(class_dir):
+            print(f"⚠️ Dossier introuvable pour la classe : '{class_name}' (Chemin: {class_dir})")
             continue
 
-        if label_name not in class_to_idx:
-            skipped_bad_label += 1
-            continue
+        for filename in os.listdir(class_dir):
+            if filename.lower().endswith(valid_extensions):
+                image_path = os.path.join(class_dir, filename)
+                samples.append({
+                    "image_path": image_path,
+                    "label_name": class_name,
+                    "label_idx": idx,
+                    "filename": filename,
+                })
 
-        if filename is None:
-            skipped_missing_file += 1
-            continue
-
-        image_path = os.path.join(images_dir, filename)
-
-        if not os.path.exists(image_path):
-            skipped_missing_file += 1
-            continue
-
-        samples.append({
-            "image_path": image_path,
-            "label_name": label_name,
-            "label_idx": class_to_idx[label_name],
-            "filename": filename,
-        })
-
-    print(f"✅ {len(samples)} images valides trouvées")
-    print(f"⚠️ Sans label : {skipped_no_label}")
-    print(f"⚠️ Labels inconnus : {skipped_bad_label}")
-    print(f"⚠️ Fichiers absents : {skipped_missing_file}")
-
+    print(f"✅ {len(samples)} images valides trouvées dans les dossiers.")
     return samples
 
 
@@ -223,187 +155,40 @@ class AuroraDataset(Dataset):
 
 
 # =========================================================
-# MIXUP
-# =========================================================
-def mixup_data(x, y, alpha=0.4):
-    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
-
-    mixed_x = lam * x + (1 - lam) * x[index]
-    y_a = y
-    y_b = y[index]
-    return mixed_x, y_a, y_b, lam
-
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
-
-# =========================================================
-# PREPARATION DONNEES
-# =========================================================
-all_samples = load_samples_from_labelstudio(JSON_PATH, IMAGES_DIR, CLASS_TO_IDX)
-
-if len(all_samples) == 0:
-    raise ValueError("Aucune image exploitable trouvée.")
-
-all_labels = np.array([s["label_idx"] for s in all_samples])
-
-print("\nRépartition globale :")
-global_counts = Counter(all_labels)
-for class_idx in range(NUM_CLASSES):
-    count = global_counts.get(class_idx, 0)
-    pct = 100.0 * count / len(all_samples)
-    print(f"  {CLASS_NAMES[class_idx]}: {count} ({pct:.2f}%)")
-
-indices = np.arange(len(all_samples))
-
-train_idx, temp_idx = train_test_split(
-    indices,
-    test_size=0.30,
-    stratify=all_labels,
-    random_state=SEED
-)
-
-temp_labels = all_labels[temp_idx]
-
-val_idx, test_idx = train_test_split(
-    temp_idx,
-    test_size=0.50,
-    stratify=temp_labels,
-    random_state=SEED
-)
-
-train_samples = [all_samples[i] for i in train_idx]
-val_samples = [all_samples[i] for i in val_idx]
-test_samples = [all_samples[i] for i in test_idx]
-
-print("\nRépartition après split :")
-print(f"  Train: {len(train_samples)}")
-print(f"  Val  : {len(val_samples)}")
-print(f"  Test : {len(test_samples)}")
-
-train_dataset = AuroraDataset(train_samples, transform=train_transform)
-val_dataset = AuroraDataset(val_samples, transform=eval_transform)
-test_dataset = AuroraDataset(test_samples, transform=eval_transform)
-
-
-# =========================================================
-# SAMPLER PONDERE + CLASS WEIGHTS
-# =========================================================
-train_labels = np.array([s["label_idx"] for s in train_samples])
-train_counts = Counter(train_labels)
-
-sample_weights = np.array([
-    len(train_labels) / train_counts[label]
-    for label in train_labels
-], dtype=np.float64)
-
-train_sampler = WeightedRandomSampler(
-    weights=torch.DoubleTensor(sample_weights),
-    num_samples=len(sample_weights),
-    replacement=True
-)
-
-class_weights = torch.tensor(
-    [len(train_labels) / train_counts.get(i, 1) for i in range(NUM_CLASSES)],
-    dtype=torch.float32
-).to(DEVICE)
-
-print("\nPoids de classes :")
-for i, w in enumerate(class_weights):
-    print(f"  {CLASS_NAMES[i]}: {w.item():.4f}")
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    sampler=train_sampler,
-    num_workers=NUM_WORKERS
-)
-
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS
-)
-
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS
-)
-
-
-# =========================================================
-# MODELE
+# MODEL
 # =========================================================
 def build_model(num_classes):
-    model = models.efficientnet_b2(weights=models.EfficientNet_B2_Weights.DEFAULT)
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
 
+    # Freeze du backbone
     for param in model.parameters():
         param.requires_grad = False
 
-    in_features = model.classifier[1].in_features
-    model.classifier = nn.Sequential(
-        nn.Dropout(p=0.35, inplace=True),
-        nn.Linear(in_features, 256),
-        nn.ReLU(inplace=True),
-        nn.Dropout(p=0.25),
-        nn.Linear(256, num_classes)
+    in_features = model.fc.in_features
+    model.fc = nn.Sequential(
+        nn.Dropout(0.35),
+        nn.Linear(in_features, num_classes)
     )
 
     return model
 
 
-model = build_model(NUM_CLASSES).to(DEVICE)
-
-
-def count_params(m):
-    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in m.parameters())
-    return trainable, total
-
-
-trainable, total = count_params(model)
-print(f"\n🚀 Device : {DEVICE}")
-print(f"Paramètres entraînables : {trainable:,} / {total:,}")
-
-
-# =========================================================
-# LOSS
-# =========================================================
-criterion = nn.CrossEntropyLoss(
-    weight=class_weights,
-    label_smoothing=0.10
-)
-
-
 # =========================================================
 # TRAIN / EVAL
 # =========================================================
-def train_one_epoch(model, loader, criterion, optimizer, use_mixup=False):
+def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
     y_true = []
     y_pred = []
 
     for images, labels in loader:
-        images = images.to(DEVICE)
-        labels = labels.to(DEVICE)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-
-        if use_mixup and random.random() < MIXUP_PROB:
-            images, y_a, y_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
-            outputs = model(images)
-            loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
-        else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-
+        outputs = model(images)
+        loss = criterion(outputs, labels)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -421,7 +206,7 @@ def train_one_epoch(model, loader, criterion, optimizer, use_mixup=False):
     return epoch_loss, epoch_acc, epoch_f1
 
 
-def evaluate(model, loader, criterion):
+def evaluate(model, loader, criterion, device):
     model.eval()
     running_loss = 0.0
     y_true = []
@@ -429,8 +214,8 @@ def evaluate(model, loader, criterion):
 
     with torch.no_grad():
         for images, labels in loader:
-            images = images.to(DEVICE)
-            labels = labels.to(DEVICE)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             outputs = model(images)
             loss = criterion(outputs, labels)
@@ -448,39 +233,6 @@ def evaluate(model, loader, criterion):
     return epoch_loss, epoch_acc, epoch_f1, y_true, y_pred
 
 
-def evaluate_tta(model, dataset, n_aug=3):
-    model.eval()
-    all_probs = []
-
-    for _ in range(n_aug):
-        tta_dataset = AuroraDataset(dataset.samples, transform=tta_transform)
-        tta_loader = DataLoader(
-            tta_dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False,
-            num_workers=NUM_WORKERS
-        )
-
-        probs_run = []
-        with torch.no_grad():
-            for images, _ in tta_loader:
-                images = images.to(DEVICE)
-                outputs = model(images)
-                probs = torch.softmax(outputs, dim=1)
-                probs_run.append(probs.cpu().numpy())
-
-        all_probs.append(np.concatenate(probs_run, axis=0))
-
-    mean_probs = np.mean(all_probs, axis=0)
-    y_pred = np.argmax(mean_probs, axis=1)
-    y_true = [s["label_idx"] for s in dataset.samples]
-
-    acc = 100.0 * np.mean(np.array(y_true) == y_pred)
-    f1 = f1_score(y_true, y_pred, average="macro")
-
-    return acc, f1, y_true, y_pred
-
-
 def run_phase(
     model,
     train_loader,
@@ -492,8 +244,8 @@ def run_phase(
     phase_name,
     best_val_f1,
     best_model_wts,
-    use_mixup=False,
-    patience=EARLY_STOPPING_PATIENCE
+    device,
+    patience=4,
 ):
     epochs_no_improve = 0
 
@@ -501,9 +253,11 @@ def run_phase(
         lr = optimizer.param_groups[0]["lr"]
 
         train_loss, train_acc, train_f1 = train_one_epoch(
-            model, train_loader, criterion, optimizer, use_mixup=use_mixup
+            model, train_loader, criterion, optimizer, device
         )
-        val_loss, val_acc, val_f1, _, _ = evaluate(model, val_loader, criterion)
+        val_loss, val_acc, val_f1, _, _ = evaluate(
+            model, val_loader, criterion, device
+        )
 
         scheduler.step()
 
@@ -531,150 +285,220 @@ def run_phase(
 
 
 # =========================================================
-# PHASE 1 : CLASSIFIER SEUL
+# MAIN
 # =========================================================
-print("\n===== PHASE 1 : classifier uniquement =====")
+def main():
+    set_seed(SEED)
 
-optimizer = optim.AdamW(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=1e-3,
-    weight_decay=1e-4
-)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        
+    print(f"Dossier source : {IMAGES_DIR}")
+    
+    # Chargement depuis les dossiers
+    all_samples = load_samples_from_folders(IMAGES_DIR, CLASS_TO_IDX)
+    
+    if len(all_samples) == 0:
+        raise ValueError("Aucune image exploitable trouvée dans les dossiers.")
 
-scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    optimizer,
-    T_0=4,
-    T_mult=1,
-    eta_min=1e-5
-)
+    all_labels = np.array([s["label_idx"] for s in all_samples])
 
-best_val_f1 = -1.0
-best_model_wts = copy.deepcopy(model.state_dict())
+    print("\nRépartition globale :")
+    global_counts = Counter(all_labels)
+    for class_idx in range(NUM_CLASSES):
+        count = global_counts.get(class_idx, 0)
+        pct = 100.0 * count / len(all_samples) if len(all_samples) > 0 else 0
+        print(f"  {CLASS_NAMES[class_idx]}: {count} ({pct:.2f}%)")
 
-best_val_f1, best_model_wts = run_phase(
-    model,
-    train_loader,
-    val_loader,
-    criterion,
-    optimizer,
-    scheduler,
-    NUM_EPOCHS_PHASE1,
-    "Phase1",
-    best_val_f1,
-    best_model_wts,
-    use_mixup=False
-)
+    indices = np.arange(len(all_samples))
 
+    train_idx, temp_idx = train_test_split(
+        indices,
+        test_size=0.30,
+        stratify=all_labels,
+        random_state=SEED
+    )
 
-# =========================================================
-# PHASE 2 : DERNIERS BLOCS
-# =========================================================
-print("\n===== PHASE 2 : dégel blocs finaux =====")
+    temp_labels = all_labels[temp_idx]
 
-for name, param in model.named_parameters():
-    if any(f"features.{i}" in name for i in [5, 6, 7]):
+    val_idx, test_idx = train_test_split(
+        temp_idx,
+        test_size=0.50,
+        stratify=temp_labels,
+        random_state=SEED
+    )
+
+    train_samples = [all_samples[i] for i in train_idx]
+    val_samples = [all_samples[i] for i in val_idx]
+    test_samples = [all_samples[i] for i in test_idx]
+
+    print("\nRépartition après split :")
+    print(f"  Train: {len(train_samples)}")
+    print(f"  Val  : {len(val_samples)}")
+    print(f"  Test : {len(test_samples)}")
+
+    train_dataset = AuroraDataset(train_samples, transform=train_transform)
+    val_dataset = AuroraDataset(val_samples, transform=eval_transform)
+    test_dataset = AuroraDataset(test_samples, transform=eval_transform)
+
+    train_labels = np.array([s["label_idx"] for s in train_samples])
+    train_counts = Counter(train_labels)
+
+    sample_weights = np.array([
+        len(train_labels) / train_counts[label]
+        for label in train_labels
+    ], dtype=np.float64)
+
+    train_sampler = WeightedRandomSampler(
+        weights=torch.DoubleTensor(sample_weights),
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
+    class_weights = torch.tensor(
+        [len(train_labels) / train_counts.get(i, 1) for i in range(NUM_CLASSES)],
+        dtype=torch.float32
+    ).to(DEVICE)
+
+    print("\nPoids de classes :")
+    for i, w in enumerate(class_weights):
+        print(f"  {CLASS_NAMES[i]}: {w.item():.4f}")
+
+    loader_kwargs = {
+        "batch_size": BATCH_SIZE,
+        "num_workers": NUM_WORKERS,
+        "pin_memory": torch.cuda.is_available(),
+    }
+
+    train_loader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        **loader_kwargs
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        shuffle=False,
+        **loader_kwargs
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        shuffle=False,
+        **loader_kwargs
+    )
+
+    model = build_model(NUM_CLASSES).to(DEVICE)
+    trainable, total = count_params(model)
+
+    print(f"\n🚀 Device : {DEVICE}")
+    print(f"Paramètres entraînables au départ : {trainable:,} / {total:,}")
+
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=LABEL_SMOOTHING
+    )
+
+    # =====================================================
+    # PHASE 1
+    # =====================================================
+    print("\n===== PHASE 1 : classifier uniquement =====")
+
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=PHASE1_LR,
+        weight_decay=WEIGHT_DECAY
+    )
+
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=4,
+        T_mult=1,
+        eta_min=1e-5
+    )
+
+    best_val_f1 = -1.0
+    best_model_wts = copy.deepcopy(model.state_dict())
+
+    best_val_f1, best_model_wts = run_phase(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        num_epochs=NUM_EPOCHS_PHASE1,
+        phase_name="Phase1",
+        best_val_f1=best_val_f1,
+        best_model_wts=best_model_wts,
+        device=DEVICE,
+        patience=EARLY_STOPPING_PATIENCE,
+    )
+
+    # =====================================================
+    # PHASE 2
+    # =====================================================
+    print("\n===== PHASE 2 : fine-tuning layer4 =====")
+
+    for param in model.layer4.parameters():
         param.requires_grad = True
 
-trainable, total = count_params(model)
-print(f"Paramètres entraînables : {trainable:,} / {total:,}")
+    trainable, total = count_params(model)
+    print(f"Paramètres entraînables phase 2 : {trainable:,} / {total:,}")
 
-optimizer = optim.AdamW(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=5e-5,
-    weight_decay=1e-4
-)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=PHASE2_LR,
+        weight_decay=WEIGHT_DECAY
+    )
 
-scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    optimizer,
-    T_0=6,
-    T_mult=1,
-    eta_min=1e-6
-)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=6,
+        T_mult=1,
+        eta_min=1e-6
+    )
 
-best_val_f1, best_model_wts = run_phase(
-    model,
-    train_loader,
-    val_loader,
-    criterion,
-    optimizer,
-    scheduler,
-    NUM_EPOCHS_PHASE2,
-    "Phase2",
-    best_val_f1,
-    best_model_wts,
-    use_mixup=True
-)
+    best_val_f1, best_model_wts = run_phase(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        num_epochs=NUM_EPOCHS_PHASE2,
+        phase_name="Phase2",
+        best_val_f1=best_val_f1,
+        best_model_wts=best_model_wts,
+        device=DEVICE,
+        patience=EARLY_STOPPING_PATIENCE,
+    )
 
+    # =====================================================
+    # TEST FINAL
+    # =====================================================
+    model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+    print(f"\n✅ Meilleur modèle chargé — Val F1 : {best_val_f1:.4f}")
 
-# =========================================================
-# PHASE 3 : OUVERTURE PARTIELLE PLUS LARGE
-# =========================================================
-print("\n===== PHASE 3 : fine-tuning plus large =====")
+    print("\n📊 Évaluation finale sur TEST :")
+    test_loss, test_acc, test_f1, y_true, y_pred = evaluate(model, test_loader, criterion, DEVICE)
 
-for name, param in model.named_parameters():
-    if any(f"features.{i}" in name for i in [3, 4, 5, 6, 7]):
-        param.requires_grad = True
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Acc : {test_acc:.2f}%")
+    print(f"Test F1  : {test_f1:.4f}")
 
-trainable, total = count_params(model)
-print(f"Paramètres entraînables : {trainable:,} / {total:,}")
+    print("\n📌 Matrice de confusion :")
+    print(confusion_matrix(y_true, y_pred))
 
-optimizer = optim.AdamW(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=1e-5,
-    weight_decay=1e-4
-)
-
-scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    optimizer,
-    T_0=8,
-    T_mult=1,
-    eta_min=1e-7
-)
-
-best_val_f1, best_model_wts = run_phase(
-    model,
-    train_loader,
-    val_loader,
-    criterion,
-    optimizer,
-    scheduler,
-    NUM_EPOCHS_PHASE3,
-    "Phase3",
-    best_val_f1,
-    best_model_wts,
-    use_mixup=True,
-    patience=6
-)
+    print("\n📌 Classification report :")
+    print(classification_report(
+        y_true,
+        y_pred,
+        target_names=CLASS_NAMES,
+        digits=3
+    ))
 
 
-# =========================================================
-# CHARGEMENT MEILLEUR MODELE
-# =========================================================
-model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
-print(f"\n✅ Meilleur modèle chargé — Val F1 : {best_val_f1:.4f}")
-
-
-# =========================================================
-# TEST FINAL
-# =========================================================
-print("\n📊 Évaluation standard sur TEST :")
-test_loss, test_acc, test_f1, y_true, y_pred = evaluate(model, test_loader, criterion)
-print(f"  Test Loss: {test_loss:.4f}")
-print(f"  Test Acc : {test_acc:.2f}%")
-print(f"  Test F1  : {test_f1:.4f}")
-
-print(f"\n📊 Évaluation TTA sur TEST (n={TTA_N}) :")
-tta_acc, tta_f1, y_true_tta, y_pred_tta = evaluate_tta(model, test_dataset, n_aug=TTA_N)
-print(f"  TTA Acc: {tta_acc:.2f}%")
-print(f"  TTA F1 : {tta_f1:.4f}")
-
-print("\n📌 Matrice de confusion (TTA) :")
-print(confusion_matrix(y_true_tta, y_pred_tta))
-
-print("\n📌 Classification report (TTA) :")
-print(classification_report(
-    y_true_tta,
-    y_pred_tta,
-    target_names=CLASS_NAMES,
-    digits=3
-))
+if __name__ == "__main__":
+    freeze_support()
+    main()

@@ -3,14 +3,17 @@ import random
 import shutil
 from pathlib import Path
 
+# Script pour filtrer les images : prendre un échantillon de 200k images depuis 
+# le dossier source, et les déplacer dans un dossier de destination
+
 # Dossier source (racine)
-SOURCE_DIR = Path("images_kiruna/allsky-sweden-kiruna-2024-2")
+SOURCE_DIR = Path("images_kiruna/allsky-sweden-kiruna-2024-1")
 
 # Dossier destination
-DEST_DIR = Path("data/image_test")
+DEST_DIR = Path("images_kiruna/images")
 
 # Nombre d'images à garder
-NB_IMAGES = 500
+NB_IMAGES = 200000
 
 # Extensions d'images autorisées
 EXTENSIONS = [".jpg", ".jpeg", ".png"]
